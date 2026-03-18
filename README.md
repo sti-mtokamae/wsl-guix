@@ -9,7 +9,7 @@
 - **Guix System のインストール** ❌ ではない
 - **Guix を Debian/Ubuntu と同じパッケージマネージャとして使う** ✅
 - **Guix System のような完全な systemd 統合は想定していない手順** ✅
-- デーモンの自動起動までは対象外（必要に応じて wrapper script を作成）
+- デーモンは guix pull 実行後、systemd により WSL 起動時に自動起動されます ✅
 
 ## 1. 旧 Guix が存在する場合は削除（クリーンスタート）が必要
 
@@ -39,7 +39,7 @@ mv var/guix /var/
 
 Guix の世界（/gnu/store と /var/guix）が 1.5.0 の状態で再構築される。
 
-## 4. デーモンを起動（WSL は手動起動）
+## 4. デーモンを起動（初期段階では手動起動）
 
 展開されたディレクトリを確認：
 
@@ -53,43 +53,28 @@ ls /gnu/store/ | grep guix
 /gnu/store/*-guix-1.5.0/bin/guix-daemon --build-users-group=guixbuild
 ```
 
-WSL では systemd 統合が不完全なため、デーモンは手動で起動する必要がある。
+この段階では systemd service が無いため、デーモンは手動で起動する必要があります。guix pull 実行後、systemd により自動管理されるようになります。
 
-### 4.1 日々のデーモン管理
+### 4.1 デーモンの起動（1.5.0 バイナリ段階）
 
-**デーモンは root で起動・保持**
+**デーモンは起動後、起動させ続ける必要があります**
 
-デーモンが起動したままの状態を保つ必要があり、以下の方法から選択：
+この段階ではまだ systemd service が無いため、以下の選択肢から選ぶ：
 
-**方法1: 毎回手動で起動**
+**方法1: 起動させ続ける（推奨）**
+
+デーモンを一度起動したら、起動させ続けます：
+```bash
+/gnu/store/*-guix-1.5.0/bin/guix-daemon --build-users-group=guixbuild
+```
+
+root セッションで上記コマンドを実行するだけで、WSL インスタンス全体で daemon が利用可能になります。複数のターミナルウィンドウを開いても、すべて同じ WSL インスタンスを共有するため、一度起動すれば十分です。
+
+**方法2: 毎回手動で起動**
 
 Guix を使う度に以下を実行：
 ```bash
 sudo /gnu/store/*-guix-1.5.0/bin/guix-daemon --build-users-group=guixbuild &
-```
-
-**方法2: シェル起動時に自動実行（推奨）**
-
-`/home/mtok/.bashrc` に以下を追加：
-```bash
-pgrep -f guix-daemon > /dev/null || sudo /gnu/store/*-guix-1.5.0/bin/guix-daemon --build-users-group=guixbuild &
-```
-
-**注意**: パスワードなしで sudo を実行するため、`/etc/sudoers` に以下を追加して置いてください：
-```
-mtok ALL=(ALL) NOPASSWD: /gnu/store/*-guix-*/bin/guix-daemon
-```
-
-**方法3: systemctl で管理（参考：WSLでは不安定らしい）**
-
-systemd が利用可能であれば、以下でデーモンを起動：
-```bash
-sudo systemctl start guix-daemon
-```
-
-起動時に自動起動させたい場合：
-```bash
-sudo systemctl enable guix-daemon
 ```
 
 ## 5. substitute（代替バイナリ）鍵の登録
@@ -128,6 +113,22 @@ EOF
 
 WSL でも substitute が効くため高速に完了する。
 
+### 6.1 guix pull 実行時の systemd 自動設定
+
+`guix pull` 実行時、guix が systemd service ファイル（`/etc/systemd/system/guix-daemon.service`）を自動生成します。その後、systemd により daemon が以下のように自動管理されます：
+
+- WSL 起動時に自動起動
+- WSL シャットダウン時に自動停止
+- 予期しないクラッシュ時の自動再起動
+
+自動設定されたかどうかを確認：
+
+```bash
+systemctl is-enabled guix-daemon
+```
+
+出力が `enabled` の場合、daemon は WSL 起動時に自動起動が有効になっています。この場合、セクション 4.1 の手動起動は不要です。以降は WSL 起動時に自動的に daemon が起動されます。
+
 ## 7. 環境変数の設定（Guix を PATH に通す）
 
 ### 7.1 一回限りの設定
@@ -163,16 +164,7 @@ source /root/.bashrc
 
 ### 7.3 一般ユーザーでの利用設定
 
-**一般ユーザーから guix を使う場合**
-
-まず、必要なディレクトリを作成し、ユーザープロファイルを初期化します：
-
-```bash
-mkdir -p ~/.config/guix
-/gnu/store/*-guix-1.5.0/bin/guix pull
-```
-
-初期化後、各ユーザーのシェル起動スクリプト（`~/.bashrc` など）に以下を追加：
+各ユーザーのシェル起動スクリプト（`~/.bashrc` など）に以下を追加：
 ```bash
 {
   echo ''
@@ -190,9 +182,11 @@ source ~/.bashrc
 
 以降、新しいシェル起動時に自動的に `guix` コマンドが使用可能になります。
 
-**注意**: 
-- デーモンは root で起動・保持されているため、一般ユーザーは guix コマンド経由で Guix 機能を利用します
-- 各ユーザーは独立した `~/.config/guix/current` を持つため、それぞれで `guix pull` を実行する必要があります
+**重要な注意**：
+- PATH 設定だけで `guix --version`、`guix package -A` などの読み取り操作は使用可能
+- ただし、`guix install` などの操作にはデーモンが必要です
+- デーモンが起動していない場合、"Connection refused" エラーになります
+- デーモンは root で起動・保持される必要があります（セクション 4.1 参照）
 
 ## 8. 動作確認
 
@@ -236,6 +230,25 @@ Guix が“普通に使える状態”に到達
 - substitute の鍵を登録すれば、ビルド地獄を回避し時間節約が大きい（不正な挙動なし）
 - `guix pull` が成功すれば最新の Guix が手に入る
 - 以降は普通の Linux と同じように使用可能
+
+### WSL 設定（/etc/wsl.conf）
+
+guix pull による systemd 自動起動を有効にするため、以下の設定が必要です：
+
+```ini
+[boot]
+systemd=true
+```
+
+このファイルは Windows 側の `%USERPROFILE%\.wslconfig` と異なり、WSL の Linux インスタンス側の `/etc/wsl.conf` です。
+
+**確認方法：**
+
+```bash
+cat /etc/wsl.conf
+```
+
+出力が上記の内容であれば、daemon は WSL 起動時に自動起動されます。
 
 ## ✨ まとめ
 
